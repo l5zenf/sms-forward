@@ -69,7 +69,10 @@ impl PortOwner {
     /// Uses serialport's built-in timeout; returns `Ok(total_bytes)` where
     /// total_bytes=0 means we hit a serial timeout without any input.
     fn read_until_newline(&self, line: &mut String) -> std::io::Result<usize> {
-        let mut guard = self.port.lock().map_err(|_| std::io::Error::other("poisoned"))?;
+        let mut guard = self
+            .port
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned"))?;
         let mut byte = [0u8; 1];
         let mut total = 0usize;
         // The port has a 100ms poll timeout (we configured during open),
@@ -100,7 +103,10 @@ impl PortOwner {
     }
 
     fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut guard = self.port.lock().map_err(|_| std::io::Error::other("poisoned"))?;
+        let mut guard = self
+            .port
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned"))?;
         let mut written = 0;
         while written < bytes.len() {
             let n = guard.write(&bytes[written..])?;
@@ -126,7 +132,12 @@ impl AtClient {
             urc_rx: Mutex::new(urc_rx),
         };
 
-        tokio::spawn(reader_task(port_path, baud_rate, cmd_rx, urc_tx));
+        std::thread::Builder::new()
+    .name("at-reader".to_string())
+    .spawn(move || {
+        reader_worker(port_path, baud_rate, cmd_rx, urc_tx);
+    })
+    .expect("failed to spawn at-reader thread");
 
         client
     }
@@ -189,18 +200,15 @@ impl AtClient {
         }
     }
 
-    /// Poll for the next pending URC. Returns None immediately if empty.
-    pub async fn read_line(&self) -> Result<Option<AtLine>, AppError> {
+    pub async fn recv_line(&self) -> Result<AtLine, AppError> {
         let mut rx = self.urc_rx.lock().await;
-        match rx.try_recv() {
-            Ok(line) => {
+
+        match rx.recv().await {
+            Some(line) => {
                 debug!(line = ?line, "[AT] dequeue URC");
-                Ok(Some(line))
+                Ok(line)
             }
-            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                Err(AppError::ModemNotInitialized)
-            }
+            None => Err(AppError::ModemNotInitialized),
         }
     }
 
@@ -244,19 +252,16 @@ impl AtClient {
 /// including `+CPIN:` / `+CSQ:` / `+CREG:` style replies — is treated as
 /// a command response when a `send_command` is in flight.
 fn is_urc(line: &AtLine) -> bool {
-    matches!(
-        line,
-        AtLine::Cmti { .. } | AtLine::Ring | AtLine::Clip(_)
-    )
+    matches!(line, AtLine::Cmti { .. } | AtLine::Ring | AtLine::Clip(_))
 }
 
-async fn reader_task(
+fn reader_worker(
     port_path: String,
     baud_rate: u32,
     mut cmd_rx: mpsc::UnboundedReceiver<ReaderMsg>,
     urc_tx: mpsc::UnboundedSender<AtLine>,
 ) {
-    debug!(port = %port_path, "[AT-reader] task starting");
+    debug!(port = %port_path, "[AT-reader] worker starting");
 
     let port = match serialport::new(&port_path, baud_rate)
         .timeout(Duration::from_millis(100))
@@ -270,56 +275,59 @@ async fn reader_task(
         Err(e) => {
             let detail = e.to_string();
             error!(port = %port_path, error = %detail, "[AT-reader] failed to open serial port");
-            while let Some(msg) = cmd_rx.recv().await {
+
+            while let Some(msg) = cmd_rx.blocking_recv() {
                 match msg {
-                    ReaderMsg::OpenProbe(s) => { let _ = s.send(Err(detail.clone())); }
-                    ReaderMsg::SendAndRegister { reply, .. } => { let _ = reply.send(Vec::new()); }
+                    ReaderMsg::OpenProbe(s) => {
+                        let _ = s.send(Err(detail.clone()));
+                    }
+                    ReaderMsg::SendAndRegister { reply, .. } => {
+                        let _ = reply.send(Vec::new());
+                    }
                     _ => {}
                 }
             }
+
             return;
         }
     };
+
     info!(port = %port_path, "[AT-reader] serial port opened");
 
     let port_owner = Arc::new(PortOwner {
         port: StdMutex::new(port),
     });
 
-    // Pending command state. While Some, command-reply lines accumulate into
-    // `collected`; the terminal line completes the wait.
     let mut pending: Option<oneshot::Sender<Vec<AtLine>>> = None;
     let mut collected: Vec<AtLine> = Vec::new();
-
     let mut read_buf = String::new();
-    let _start = Instant::now();
 
     loop {
-        // 1) Drain control messages non-blocking.
         while let Ok(msg) = cmd_rx.try_recv() {
             match msg {
                 ReaderMsg::OpenProbe(sender) => {
                     let _ = sender.send(Ok(()));
                 }
+
                 ReaderMsg::Write(s) => {
                     if let Err(e) = port_owner.write_all(s.as_bytes()) {
                         warn!(error = %e, "[AT-reader] write failed");
                     }
                 }
+
                 ReaderMsg::SendAndRegister { cmd, reply } => {
-                    // 1a) Resolve any in-flight waiter first.
                     if let Some(old) = pending.take() {
                         let _ = old.send(std::mem::take(&mut collected));
                     }
-                    // 1b) Register the new waiter BEFORE the bytes are
-                    // written, so any URC/OK that arrives is captured into
-                    // `collected` correctly.
+
                     pending = Some(reply);
                     collected.clear();
+
                     if let Err(e) = port_owner.write_all(cmd.as_bytes()) {
                         warn!(error = %e, "[AT-reader] write failed");
                     }
                 }
+
                 ReaderMsg::Cancel => {
                     if let Some(old) = pending.take() {
                         let _ = old.send(std::mem::take(&mut collected));
@@ -329,19 +337,18 @@ async fn reader_task(
             }
         }
 
-        // 2) Try a non-blocking read of one line. serialport's read timeout
-        // returns 0 after 500ms with no data, so we won't truly block.
         read_buf.clear();
+
         match port_owner.read_until_newline(&mut read_buf) {
             Ok(n) if n > 0 => {
-                // Trim CRLF.
                 while read_buf.ends_with('\n') || read_buf.ends_with('\r') {
                     read_buf.pop();
                 }
+
                 if read_buf.is_empty() {
-                    tokio::task::yield_now().await;
                     continue;
                 }
+
                 let parsed = at_parser::parse_line(&read_buf);
                 debug!(line = %read_buf, parsed = ?parsed, "[AT] raw line");
 
@@ -358,27 +365,24 @@ async fn reader_task(
                         urc_push(&urc_tx, parsed);
                     }
                 } else if pending.is_some() && !is_urc(&parsed) {
-                    // A reply line (e.g. +CPIN: READY, +CSQ: 24,0) for the
-                    // command in flight — accumulate so send_command sees it.
                     collected.push(parsed.clone());
                 } else {
-                    // Either no command in flight, or this is a true URC.
                     urc_push(&urc_tx, parsed);
                 }
             }
+
             Ok(_) => {
-                // No data yet; sleep briefly so we don't pin a CPU.
-                // 20ms ≈ 50 wakeups/s, latency ≥ priority.
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                // 没有串口数据，当前线程 sleep，不占 tokio worker。
+                std::thread::sleep(Duration::from_millis(20));
             }
+
             Err(e) => {
                 warn!(error = %e, "[AT-reader] read error; continuing");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
 }
-
 fn urc_push(tx: &mpsc::UnboundedSender<AtLine>, line: AtLine) {
     if tx.send(line).is_err() {
         warn!("[AT-reader] URC receiver gone; dropping line");

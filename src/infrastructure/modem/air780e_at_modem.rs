@@ -152,37 +152,38 @@ impl ModemPort for Air780eAtModem {
 
     async fn next_event(&self) -> Result<ModemEvent, AppError> {
         loop {
-            match self.client.read_line().await? {
-                None => {
-                    // Both 0-bytes-available and Empty-line branches end up here.
-                    // Yield so this loop doesn't hog the CPU while waiting.
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Some(AtLine::Cmti { mem, index }) => {
+            match self.client.recv_line().await? {
+                AtLine::Cmti { mem, index } => {
                     info!(mem = %mem, index = index, "[AT] +CMTI URC parsed");
                     let raw = self.read_sms_pdu(&mem, index).await?;
                     return Ok(ModemEvent::NewSms(raw));
                 }
-                Some(AtLine::Ring) => {
+
+                AtLine::Ring => {
                     info!("incoming call (RING)");
                     return Ok(ModemEvent::Ring);
                 }
-                Some(AtLine::Clip(data)) => {
+
+                AtLine::Clip(data) => {
                     info!(data = %data, "incoming call (CLIP)");
                     return Ok(ModemEvent::Clip(data));
                 }
-                Some(AtLine::Error) => {
+
+                AtLine::Error => {
                     warn!("unexpected ERROR from modem");
                     return Ok(ModemEvent::Error("unexpected ERROR".into()));
                 }
-                Some(AtLine::CmeError(code, msg)) => {
+
+                AtLine::CmeError(code, msg) => {
                     warn!(code = code, msg = %msg, "CME error from modem");
                     return Ok(ModemEvent::Error(format!("CME {}: {}", code, msg)));
                 }
-                _ => {
-                    // No interesting event, sleep briefly to avoid busy-looping
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                other => {
+                    // recv_line().await 本身已经阻塞等待了，
+                    // 所以这里不需要 sleep。
+                    debug!(line = ?other, "[AT] ignored non-event line");
+                    continue;
                 }
             }
         }
