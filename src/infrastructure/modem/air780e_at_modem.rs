@@ -95,7 +95,8 @@ impl Air780eAtModem {
             }
             InitStep::SetStorage => {
                 info!("setting SMS storage...");
-                self.send_at_ok(r#"AT+CPMS="SM","SM","SM""#, &step_name).await?;
+                self.send_at_ok(r#"AT+CPMS="SM","SM","SM""#, &step_name)
+                    .await?;
             }
             InitStep::SetNewMessageIndication => {
                 info!("setting new message indication...");
@@ -236,7 +237,10 @@ impl ModemPort for Air780eAtModem {
             .iter()
             .find_map(|l| {
                 if let AtLine::Data(s) = l {
-                    if !s.starts_with('+') && s.len() > 10 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                    if !s.starts_with('+')
+                        && s.len() > 10
+                        && s.chars().all(|c| c.is_ascii_hexdigit())
+                    {
                         Some(s.clone())
                     } else {
                         None

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use kameo::actor::PreparedActor;
 use sea_orm::Database;
 use tracing::{info, warn};
+use tracing_subscriber::prelude::*;
 
 use gg_guard::application::actors::at_actor::AtActor;
 use gg_guard::application::actors::forwarder_actor::ForwarderActor;
@@ -23,11 +24,18 @@ use gg_guard::infrastructure::persistence::seaorm_sms_repository::SeaOrmSmsRepos
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    let console_layer = console_subscriber::ConsoleLayer::builder()
+        .server_addr(([0, 0, 0, 0], 6669))
+        .spawn();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    // EnvFilter mounts only on fmt::layer so it doesn't strip tokio's
+    // TRACE-level task spans that console_layer needs to see.
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(tracing_subscriber::fmt::layer().with_filter(filter))
         .init();
 
     info!("gg-guard starting...");
