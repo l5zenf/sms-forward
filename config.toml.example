@@ -1,0 +1,38 @@
+# gg-guard configuration template.
+# Copy to /etc/gg-guard/config.toml on the target machine.
+# Environment variables GG_GUARD_* override these values.
+
+[app]
+name = "gg-guard"
+instance_id = "pi-air780e-01"
+
+[modem]
+# ttyACM0 is the AT command port on the EigenComm Compo (Air780E-compatible).
+# For a guaranteed-stable path under udev, prefer the by-id symlink:
+#   /dev/serial/by-id/usb-EigenComm_EigenComm_Compo_*-if02
+port = "/dev/ttyACM0"
+baud_rate = 115200
+storage = "SM"
+read_buffer_limit = 4096
+init_timeout_secs = 60
+sim_ready_wait_secs = 60
+
+[database]
+url = "sqlite:///var/lib/gg-guard/sms.db?mode=rwc"
+max_connections = 1
+
+[forwarder]
+kind = "webhook"
+url = "https://example.com/sms-webhook"
+timeout_secs = 10
+
+[retry]
+max_retry = 10
+base_delay_secs = 60
+max_delay_secs = 3600
+
+[worker]
+forward_interval_secs = 3
+reaper_interval_secs = 60
+health_interval_secs = 60
+sending_timeout_secs = 300

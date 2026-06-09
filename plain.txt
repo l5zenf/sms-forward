@@ -1,0 +1,1461 @@
+下面给你一版**完整 MVP 实现计划**。这版不是单纯架构图，而是能直接拆任务、写代码、验收的计划。
+
+目标：**树莓派 + Air780E + Rust/Kameo + SQLite/SeaORM，实现可靠短信接收、中文兼容、持久化队列、异步转发。**
+
+---
+
+# 1. MVP 总目标
+
+做一个树莓派常驻服务：
+
+```text
+air780e-smsd
+  ├─ 初始化 Air780E AT 串口
+  ├─ 监听 +CMTI 新短信通知
+  ├─ AT+CMGR 读取 PDU 短信
+  ├─ 解码中文 / 长短信
+  ├─ 先写入 SQLite
+  ├─ 写入成功后 AT+CMGD 删除模块短信
+  ├─ 标记 status=pending
+  ├─ ForwarderActor 拉取 pending
+  ├─ 转发成功标记 sent
+  └─ 转发失败 pending 重试 / failed
+```
+
+核心原则：
+
+```text
+宁可重复转发，也不能丢短信。
+```
+
+---
+
+# 2. 和 main.lua 初始化保持一致的点
+
+原 `main.lua` 初始化里做了这些关键事：使用 `uart.VUART_0`，设置 `max_buffer_size=50`，调用 `mobile.setAuto(0)` 禁用自动数据连接，初始化 WDT，初始化 UART `115200 8N1`，注册短信、SIM、来电事件，注册 UART 命令解析，启动消息队列消费者，5 秒后发送 `system_ready`，每 60 秒发一次 `heartbeat`。([GitHub][1])
+
+Rust MVP 要对齐这些语义：
+
+| main.lua 初始化语义          | Rust/AT MVP 对应                    |
+| ----------------------- | --------------------------------- |
+| USB 虚拟串口通信              | 打开 Air780E AT 口 `/dev/ttyUSBx`    |
+| 115200 8N1              | 串口配置 115200 8N1                   |
+| 禁用自动数据连接                | 禁用 ModemManager，不启用 PPP/QMI/ECM   |
+| 内存队列上限                  | Kameo bounded mailbox + SQLite 队列 |
+| `SMS_INC` 事件            | `AT+CNMI=2,1,0,0,0` 监听 `+CMTI`    |
+| `SIM_IND`               | `AT+CPIN?` 轮询/状态记录                |
+| `CC_IND`                | MVP 预留 `AT+CLIP=1`，来电事件放 MVP-2    |
+| WDT                     | systemd 重启 + HealthActor 心跳       |
+| `system_ready`          | 初始化完成后记录 ready event              |
+| 60 秒 heartbeat          | HealthActor 每 60 秒采集状态            |
+| buffer overflow 4096 清理 | AT reader buffer 限制 4096/8192     |
+
+---
+
+# 3. MVP 功能边界
+
+## MVP-1 必须做
+
+| 模块         | 必须实现                                                                |
+| ---------- | ------------------------------------------------------------------- |
+| 实机 AT 验证   | 找到 AT 口、确认 SIM ready、确认能收到 `+CMTI`                                  |
+| 初始化        | `AT/ATE0/CMEE/CPIN/CMGF/CPMS/CNMI/CLIP/CSQ/CREG/CEREG`              |
+| PDU 收短信    | `CMGF=0`，收到 `+CMTI` 后 `CMGR`                                        |
+| 中文短信       | 支持 UCS2 / UTF-16BE 解码                                               |
+| 长短信        | 支持 UDH 分片保存与合并                                                      |
+| SQLite 持久化 | SeaORM migration + repository                                       |
+| 状态机        | `pending/sending/sent/failed/decode_failed`                         |
+| 可靠删除       | SQLite commit 成功后才 `AT+CMGD`                                        |
+| Actor 模型   | Kameo：AtActor、SmsIngestActor、ForwarderActor、ReaperActor、HealthActor |
+| 错误处理       | SNAFU 统一 AppError                                                   |
+| 依赖组织       | `Arc<dyn Trait>` 注入 modem/repo/forwarder/decoder                    |
+| 转发         | MVP 先只做 Webhook                                                     |
+| 恢复         | `sending` 超时恢复 `pending`                                            |
+| 部署         | systemd 常驻、自动重启                                                     |
+
+Kameo 的 Actor 使用 mailbox 接收消息，支持 bounded mailbox 做背压，适合这里把串口、入库、转发拆成独立异步 Actor。([Docs.rs][2]) SNAFU 的优势是给底层错误补业务上下文，比如同样是 IO 错误，可以区分“串口打开失败”“AT 超时”“数据库写入失败”。([Docs.rs][3]) SeaORM migration 的 `up/down` 可以管理建表、索引和回滚，适合这个 SQLite schema 管理。([SeaQL][4])
+
+## MVP-1 不做
+
+| 功能                          | 放到后续                |
+| --------------------------- | ------------------- |
+| 发短信                         | MVP-2               |
+| 来电转发                        | MVP-2               |
+| 兼容 `CMD_START/SMS_START` 协议 | MVP-2               |
+| Web 管理页面                    | MVP-2               |
+| 多 modem                     | MVP-2               |
+| Telegram/Bark 多转发目标         | MVP-2，MVP 先 Webhook |
+
+---
+
+# 4. 实现阶段总览
+
+```text
+阶段 0：实机 AT 验证
+阶段 1：工程骨架 + 分层接口
+阶段 2：SQLite / SeaORM 持久化
+阶段 3：AT Client + 初始化状态机
+阶段 4：PDU 解码：中文 + 长短信
+阶段 5：Kameo Actor 主流程
+阶段 6：Webhook Forwarder + 状态机
+阶段 7：恢复、心跳、systemd 部署
+阶段 8：实机验收
+```
+
+---
+
+# 5. 阶段 0：实机 AT 验证
+
+这是第一优先级。不要先写 Actor。
+
+## 必须做
+
+```bash
+ls -l /dev/ttyUSB*
+dmesg | grep -i tty
+```
+
+逐个测试：
+
+```bash
+sudo picocom -b 115200 /dev/ttyUSB0
+sudo picocom -b 115200 /dev/ttyUSB1
+sudo picocom -b 115200 /dev/ttyUSB2
+```
+
+找到能返回 `OK` 的 AT 口。
+
+手动执行：
+
+```text
+AT
+ATE0
+AT+CMEE=2
+AT+CPIN?
+AT+CSQ
+AT+CREG?
+AT+CEREG?
+AT+COPS?
+```
+
+短信初始化：
+
+```text
+AT+CMGF=0
+AT+CPMS="SM","SM","SM"
+AT+CNMI=2,1,0,0,0
+```
+
+`AT+CMGF` 用于设置短信输入/输出格式，`0` 是 PDU 模式，`1` 是 TEXT 模式；MVP 为了中文和长短信，固定用 PDU。([OpenLuat 文档][5]) `AT+CNMI` 用于设置新短信如何上报，`<mt>=1` 时新短信存储后通过 `+CMTI: <mem>,<index>` 通知 TE，官方示例就是 `AT+CNMI=2,1` 后收到 `+CMTI: "SM",1`。([OpenLuat 文档][6])
+
+收到短信后测试：
+
+```text
++CMTI: "SM",3
+
+AT+CMGR=3
+
+AT+CMGD=3
+```
+
+`AT+CMGD=<index>` 用于删除优选短信存储区里指定 index 的短信，所以后续程序必须读完并持久化后删除，避免 SIM 存储满。([OpenLuat 文档][7])
+
+## 产出物
+
+建立文档：
+
+```text
+docs/air780e-at-samples.md
+```
+
+记录：
+
+```text
+AT 口：/dev/ttyUSB?
+SIM 状态：CPIN 返回
+运营商：COPS 返回
+信号：CSQ 返回
+CNMI 配置返回
+英文短信 PDU 样本
+中文短信 PDU 样本
+中文长短信多片 PDU 样本
+```
+
+## 验收标准
+
+```text
+[ ] 找到稳定 AT 口
+[ ] AT 返回 OK
+[ ] CPIN 返回 READY
+[ ] CMGF=0 成功
+[ ] CPMS="SM","SM","SM" 成功
+[ ] CNMI=2,1,0,0,0 成功
+[ ] 收到短信时出现 +CMTI
+[ ] CMGR 能读出 PDU
+[ ] CMGD 能删除短信
+[ ] 保存中文短信 PDU 样本
+[ ] 保存中文长短信 PDU 样本
+```
+
+## 关键疑难点
+
+| 问题              | 指导                                          |
+| --------------- | ------------------------------------------- |
+| 不知道哪个是 AT 口     | 逐个 `/dev/ttyUSBx` 发 `AT`，不要猜                |
+| ModemManager 抢口 | `sudo systemctl disable --now ModemManager` |
+| 没有 `+CMTI`      | 检查 `AT+CNMI?`、SIM 是否 READY、短信存储是否满          |
+| 中文乱码            | 不用 TEXT 模式，强制 PDU                           |
+| 模块短信满           | 程序必须成功入库后 `CMGD`                            |
+
+---
+
+# 6. 阶段 1：工程骨架 + 分层接口
+
+## 目录结构
+
+```text
+air780e-smsd/
+├── Cargo.toml
+├── migration/
+├── docs/
+└── src/
+    ├── main.rs
+    ├── config/
+    │   └── settings.rs
+    ├── domain/
+    │   ├── error.rs
+    │   ├── model/
+    │   │   ├── sms_message.rs
+    │   │   ├── sms_part.rs
+    │   │   ├── modem_status.rs
+    │   │   └── forward_status.rs
+    │   ├── port/
+    │   │   ├── modem_port.rs
+    │   │   ├── forwarder_port.rs
+    │   │   └── pdu_decoder.rs
+    │   └── repository/
+    │       └── sms_repository.rs
+    ├── application/
+    │   ├── actors/
+    │   │   ├── at_actor.rs
+    │   │   ├── sms_ingest_actor.rs
+    │   │   ├── forwarder_actor.rs
+    │   │   ├── reaper_actor.rs
+    │   │   └── health_actor.rs
+    │   └── service/
+    │       ├── sms_ingest_service.rs
+    │       └── forward_service.rs
+    └── infrastructure/
+        ├── modem/
+        │   ├── air780e_at_modem.rs
+        │   ├── at_client.rs
+        │   ├── at_parser.rs
+        │   └── pdu_decoder.rs
+        ├── persistence/
+        │   ├── entity/
+        │   └── seaorm_sms_repository.rs
+        └── forwarder/
+            └── webhook_forwarder.rs
+```
+
+## 分层原则
+
+```text
+domain：只放模型、trait、错误类型
+application：放 Actor 和用例编排
+infrastructure：实现串口、SeaORM、Webhook、PDU decoder
+main.rs：组装依赖、启动 Actor
+```
+
+## 必须定义的 dyn trait
+
+```rust
+pub type DynModemPort = Arc<dyn ModemPort>;
+pub type DynSmsRepository = Arc<dyn SmsRepository>;
+pub type DynForwarderPort = Arc<dyn ForwarderPort>;
+pub type DynPduDecoder = Arc<dyn PduDecoder>;
+```
+
+## ModemPort
+
+```rust
+#[async_trait::async_trait]
+pub trait ModemPort: Send + Sync {
+    async fn init(&self) -> Result<(), AppError>;
+
+    async fn next_event(&self) -> Result<ModemEvent, AppError>;
+
+    async fn read_sms_pdu(
+        &self,
+        mem: &str,
+        index: i32,
+    ) -> Result<RawSmsPdu, AppError>;
+
+    async fn delete_sms(
+        &self,
+        mem: &str,
+        index: i32,
+    ) -> Result<(), AppError>;
+
+    async fn query_status(&self) -> Result<ModemStatus, AppError>;
+}
+```
+
+## SmsRepository
+
+```rust
+#[async_trait::async_trait]
+pub trait SmsRepository: Send + Sync {
+    async fn save_single_message(&self, sms: NewSmsMessage) -> Result<i64, AppError>;
+
+    async fn save_part(&self, part: NewSmsPart) -> Result<(), AppError>;
+
+    async fn try_assemble_multipart(
+        &self,
+        key: MultipartKey,
+    ) -> Result<Option<i64>, AppError>;
+
+    async fn save_decode_failed(
+        &self,
+        raw: RawSmsPdu,
+        error: String,
+    ) -> Result<i64, AppError>;
+
+    async fn claim_next_pending(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<SmsMessage>, AppError>;
+
+    async fn mark_sent(&self, id: i64, response: String) -> Result<(), AppError>;
+
+    async fn mark_failed(&self, id: i64, error: String) -> Result<(), AppError>;
+
+    async fn recover_stale_sending(&self) -> Result<u64, AppError>;
+}
+```
+
+## ForwarderPort
+
+```rust
+#[async_trait::async_trait]
+pub trait ForwarderPort: Send + Sync {
+    async fn forward(&self, sms: &SmsMessage) -> Result<ForwardResult, AppError>;
+}
+```
+
+## 验收标准
+
+```text
+[ ] cargo check 通过
+[ ] tracing 能输出启动日志
+[ ] config.toml 能加载
+[ ] domain 不依赖 SeaORM / reqwest / serialport / Kameo
+[ ] infrastructure 实现 domain trait
+[ ] main.rs 负责组装 Arc<dyn Trait>
+```
+
+---
+
+# 7. 阶段 2：SQLite / SeaORM 持久化
+
+## 必须建表
+
+### sms_messages
+
+```sql
+CREATE TABLE sms_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    iccid TEXT,
+    sender TEXT,
+    content TEXT,
+
+    sms_time TEXT,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    pdu_raw TEXT NOT NULL,
+    dcs INTEGER,
+    encoding TEXT,
+
+    concat_ref TEXT,
+    concat_total INTEGER,
+    concat_completed INTEGER NOT NULL DEFAULT 1,
+
+    modem_mem TEXT,
+    modem_index INTEGER,
+
+    dedupe_key TEXT NOT NULL UNIQUE,
+
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retry INTEGER NOT NULL DEFAULT 10,
+    next_retry_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    locked_at TEXT,
+    locked_by TEXT,
+
+    forwarded_at TEXT,
+    forward_response TEXT,
+    last_error TEXT,
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_sms_status_retry
+ON sms_messages(status, next_retry_at, id);
+
+CREATE INDEX idx_sms_received_at
+ON sms_messages(received_at);
+```
+
+### sms_parts
+
+```sql
+CREATE TABLE sms_parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    iccid TEXT,
+    sender TEXT NOT NULL,
+    sms_time TEXT,
+
+    concat_ref TEXT NOT NULL,
+    concat_total INTEGER NOT NULL,
+    concat_seq INTEGER NOT NULL,
+
+    pdu_raw TEXT NOT NULL,
+    decoded_content TEXT NOT NULL,
+
+    dcs INTEGER,
+    encoding TEXT,
+
+    modem_mem TEXT,
+    modem_index INTEGER,
+
+    part_dedupe_key TEXT NOT NULL UNIQUE,
+
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_sms_parts_concat
+ON sms_parts(sender, concat_ref, concat_total);
+```
+
+### modem_events
+
+```sql
+CREATE TABLE modem_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### modem_status
+
+```sql
+CREATE TABLE modem_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    sim_ready INTEGER NOT NULL DEFAULT 0,
+    registered INTEGER NOT NULL DEFAULT 0,
+    roaming INTEGER NOT NULL DEFAULT 0,
+
+    csq INTEGER,
+    rssi_dbm INTEGER,
+    operator TEXT,
+    last_error TEXT,
+
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### SQLite 初始化 PRAGMA
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+PRAGMA foreign_keys=ON;
+```
+
+## 状态机
+
+```text
+pending
+  ↓ claim
+sending
+  ├─ 转发成功 -> sent
+  ├─ 转发失败且未超限 -> pending
+  └─ 转发失败且超限 -> failed
+
+decode_failed：PDU 已保存，但解码失败
+```
+
+## claim_next_pending 必须原子化
+
+不要：
+
+```text
+SELECT pending
+UPDATE sending
+```
+
+必须：
+
+```text
+BEGIN IMMEDIATE
+SELECT 一条 pending
+UPDATE 为 sending
+COMMIT
+```
+
+SQLite 没有 PostgreSQL 的 `SKIP LOCKED`，MVP 里用 `BEGIN IMMEDIATE` 最直观。
+
+## 验收标准
+
+```text
+[ ] migration 能创建所有表
+[ ] 启动能创建 sms.db
+[ ] save_single_message 后 status=pending
+[ ] claim_next_pending 后 status=sending
+[ ] mark_sent 后 status=sent
+[ ] mark_failed 后 retry_count + 1
+[ ] retry_count 超过 max_retry 后 status=failed
+[ ] recover_stale_sending 能恢复 sending -> pending
+[ ] dedupe_key 重复时不重复插入
+[ ] sms_parts 到齐后能合并成 sms_messages
+```
+
+---
+
+# 8. 阶段 3：AT Client + 初始化状态机
+
+这是整个系统的关键。
+
+## 设计原则
+
+```text
+只有 AtActor / AtClient 能拥有串口。
+其他 Actor 不允许直接访问 serial。
+HealthActor、SmsIngestActor、ForwarderActor 都不能直接发 AT。
+```
+
+原因：AT 响应和 URC 会混在同一个串口里。必须由一个统一 reader loop 解析。
+
+## 初始化状态机
+
+```text
+OpenSerial
+  ↓
+ProbeAT
+  ↓
+DisableEcho
+  ↓
+EnableVerboseError
+  ↓
+WaitSimReady
+  ↓
+SetPduMode
+  ↓
+SetStorage
+  ↓
+SetNewMessageIndication
+  ↓
+SetClip
+  ↓
+InitialStatus
+  ↓
+Ready
+```
+
+## 初始化命令
+
+```text
+AT
+ATE0
+AT+CMEE=2
+AT+CPIN?
+AT+CMGF=0
+AT+CPMS="SM","SM","SM"
+AT+CNMI=2,1,0,0,0
+AT+CLIP=1
+AT+CSQ
+AT+CREG?
+AT+CEREG?
+AT+COPS?
+```
+
+## Reader loop 分类
+
+串口每读到一行，要分成三类：
+
+```text
+1. 当前 AT 命令响应
+2. URC 异步事件
+3. 噪声/空行/未知行
+```
+
+URC 至少支持：
+
+```text
++CMTI: "SM",3
+RING
++CLIP: ...
+NO CARRIER
+```
+
+MVP-1 只处理 `+CMTI`，但 parser 结构要预留来电。
+
+## buffer 上限
+
+对齐 `main.lua` 的 4096 buffer 保护：
+
+```text
+read_buffer_limit = 4096 或 8192
+超过上限：
+  清空当前 buffer
+  写 modem_events
+  不 panic
+```
+
+## 验收标准
+
+```text
+[ ] 能打开配置里的 /dev/ttyUSBx
+[ ] AT 返回 OK
+[ ] ATE0 后无回显
+[ ] CPIN 未 READY 时能等待重试
+[ ] 初始化失败返回 SNAFU ModemInit 错误
+[ ] +CMTI 能解析出 mem/index
+[ ] AT 超时能返回 AtTimeout
+[ ] buffer 超限能清空并记录事件
+[ ] 初始化完成后产生 system_ready
+```
+
+## 关键疑难点与指导
+
+| 难点              | 指导                                 |
+| --------------- | ---------------------------------- |
+| AT 响应和 URC 混在一起 | 必须统一 reader loop，不要每个函数自己 readline |
+| 初始化期间来了短信       | URC 先缓存，Ready 后处理                  |
+| 串口断开            | 关闭 fd，重新 open，重新执行 init            |
+| 连续 AT 超时        | 先重开串口，失败再交给 systemd 重启             |
+| SIM 不 READY     | 每 3 秒重试，最多等 60 秒                   |
+
+---
+
+# 9. 阶段 4：PDU 解码：中文 + 长短信
+
+这是 MVP 最大难点。
+
+## 必须解析字段
+
+```text
+SMSC length
+SMSC
+PDU type
+sender address
+PID
+DCS
+SCTS timestamp
+UDL
+UDH
+user data
+```
+
+## 必须支持编码
+
+| 编码              | MVP 要求       |
+| --------------- | ------------ |
+| UCS2 / UTF-16BE | 必须支持，中文短信核心  |
+| GSM 7-bit       | 支持普通英文       |
+| 8-bit           | 保存 raw，尽量不要丢 |
+| UDH multipart   | 必须支持长短信      |
+| WAP Push        | 不支持，raw 入库   |
+
+## 中文短信
+
+DCS 为 `0x08` 时，按 UCS2 / UTF-16BE 解码：
+
+```text
+4F60597D -> 你好
+```
+
+## 长短信 UDH
+
+8-bit reference：
+
+```text
+05 00 03 XX TT SS
+```
+
+含义：
+
+```text
+XX = concat_ref
+TT = total parts
+SS = current sequence
+```
+
+16-bit reference：
+
+```text
+06 08 04 XX XX TT SS
+```
+
+## 处理流程
+
+```text
+PDU
+  ↓
+解析 sender / sms_time / dcs / udh / body
+  ↓
+如果无 UDH：
+    save_single_message(status=pending)
+  ↓
+如果有 UDH：
+    save_part()
+    try_assemble_multipart()
+    如果分片齐全：
+        合并 content
+        save_single_message(status=pending)
+```
+
+## 解码失败规则
+
+```text
+CMGR 成功拿到 raw_pdu
+  ↓
+raw_pdu 必须先入库
+  ↓
+解码失败 status=decode_failed
+  ↓
+再允许 CMGD 删除模块短信
+```
+
+否则坏短信会堵住 SIM 存储。
+
+## 去重规则
+
+不要用 modem index 去重，因为 index 会复用。
+
+建议：
+
+```text
+part_dedupe_key =
+sha256(iccid + sender + sms_time + concat_ref + concat_seq + pdu_raw)
+
+message_dedupe_key =
+sha256(iccid + sender + sms_time + full_content)
+```
+
+## 验收标准
+
+```text
+[ ] 英文普通短信能解码
+[ ] 中文普通短信能解码
+[ ] 中文长短信 2 片能合并
+[ ] 中文长短信 3 片能合并
+[ ] 重复收到同一分片不重复插入
+[ ] 解码失败 raw_pdu 入库
+[ ] 解码失败不会导致程序 panic
+```
+
+## 关键疑难点与指导
+
+| 难点                 | 指导                                   |
+| ------------------ | ------------------------------------ |
+| GSM 7-bit + UDH 偏移 | 先做 UCS2，再做无 UDH 7-bit，最后做带 UDH 7-bit |
+| 长短信乱序到达            | 按 `concat_seq` 排序合并                  |
+| 分片缺失               | 只保存 part，不生成 pending message         |
+| 重复分片               | `part_dedupe_key UNIQUE`             |
+| 解码失败               | raw_pdu 落库，status=decode_failed      |
+
+---
+
+# 10. 阶段 5：Kameo Actor 主流程
+
+## Actor 列表
+
+```text
+AtActor
+SmsIngestActor
+ForwarderActor
+ReaperActor
+HealthActor
+```
+
+## AtActor
+
+职责：
+
+```text
+1. 初始化 Air780E
+2. 独占串口
+3. 监听 URC
+4. 收到 +CMTI 后执行 AT+CMGR
+5. 把 RawSmsPduReceived 发给 SmsIngestActor
+6. 收到 SmsPersisted 后执行 AT+CMGD
+7. 串口异常时重连
+```
+
+AtActor 内部需要维护：
+
+```text
+pending_delete:
+  key = mem + index
+  value = raw_pdu / received_at
+```
+
+原因：`SmsIngestActor` 是异步处理，处理完要通知 AtActor 删除对应 index。
+
+## SmsIngestActor
+
+职责：
+
+```text
+1. 接收 RawSmsPduReceived
+2. 调 PduDecoder 解码
+3. 保存 sms_parts 或 sms_messages
+4. 解码失败保存 decode_failed
+5. 成功或 raw 入库后回发 SmsPersisted 给 AtActor
+```
+
+## ForwarderActor
+
+职责：
+
+```text
+1. 每 3 秒 claim_next_pending
+2. status=pending -> sending
+3. 调 WebhookForwarder
+4. 成功 mark_sent
+5. 失败 mark_failed
+```
+
+## ReaperActor
+
+职责：
+
+```text
+每 60 秒执行 recover_stale_sending
+```
+
+把卡住的任务恢复：
+
+```text
+sending 且 locked_at 超过 5 分钟 -> pending
+```
+
+## HealthActor
+
+职责：
+
+```text
+每 60 秒向 AtActor 发 QueryStatus
+AtActor 串行执行：
+  AT+CPIN?
+  AT+CSQ
+  AT+CREG?
+  AT+CEREG?
+  AT+COPS?
+结果写 modem_status 和 modem_events
+```
+
+注意：HealthActor 不直接操作 modem。
+
+## 消息定义
+
+```rust
+pub struct RawSmsPduReceived {
+    pub mem: String,
+    pub index: i32,
+    pub raw_pdu: String,
+}
+
+pub struct SmsPersisted {
+    pub mem: String,
+    pub index: i32,
+}
+
+pub struct QueryStatus;
+
+pub struct ForwardTick;
+
+pub struct RecoverStaleSending;
+
+pub struct HealthTick;
+```
+
+## 主链路
+
+```text
+AtActor
+  ↓ +CMTI
+AT+CMGR
+  ↓
+RawSmsPduReceived -> SmsIngestActor
+  ↓
+PDU decode + SQLite commit
+  ↓
+SmsPersisted -> AtActor
+  ↓
+AT+CMGD
+```
+
+## 转发链路
+
+```text
+ForwarderActor
+  ↓
+claim_next_pending
+  ↓
+WebhookForwarder.forward
+  ↓
+mark_sent / mark_failed
+```
+
+## 验收标准
+
+```text
+[ ] FakeModem 模拟 +CMTI
+[ ] AtActor 调 read_sms_pdu
+[ ] SmsIngestActor 能入库
+[ ] 入库成功后 AtActor 调 delete_sms
+[ ] ForwarderActor 能把 pending 转 sent
+[ ] Webhook 失败时转 pending retry
+[ ] ReaperActor 能恢复 stale sending
+[ ] HealthActor 能周期写 modem_status
+```
+
+## 关键疑难点与指导
+
+| 难点           | 指导                                                        |
+| ------------ | --------------------------------------------------------- |
+| Actor 互等导致死锁 | AtActor 发消息给 SmsIngestActor，SmsIngestActor 完成后回发，不要双向同步等待 |
+| 多 Actor 抢串口  | AtActor 独占 modem                                          |
+| mailbox 无限涨  | 使用 bounded mailbox                                        |
+| DB 写失败       | 不发送 SmsPersisted，不删除模块短信                                  |
+| PDU 解码失败     | raw 已入库才发送 SmsPersisted                                   |
+
+---
+
+# 11. 阶段 6：Webhook Forwarder + 状态机
+
+## Webhook payload
+
+```json
+{
+  "id": 1,
+  "sender": "+447xxxx",
+  "content": "验证码 123456",
+  "sms_time": "2026-06-09T12:00:00Z",
+  "received_at": "2026-06-09T12:00:02Z",
+  "encoding": "ucs2",
+  "dedupe_key": "..."
+}
+```
+
+## 转发规则
+
+```text
+HTTP 2xx:
+  mark_sent
+
+HTTP 非 2xx:
+  mark_failed
+
+timeout:
+  mark_failed
+
+网络错误:
+  mark_failed
+```
+
+## mark_failed 逻辑
+
+```text
+retry_count + 1 < max_retry:
+  status = pending
+  retry_count += 1
+  next_retry_at = now + backoff
+
+retry_count + 1 >= max_retry:
+  status = failed
+  retry_count += 1
+```
+
+backoff：
+
+```text
+delay = min(max_delay_secs, base_delay_secs * retry_count)
+默认 base=60s，max=3600s，max_retry=10
+```
+
+## 幂等建议
+
+Webhook payload 必须带：
+
+```text
+id
+dedupe_key
+```
+
+因为可能出现：
+
+```text
+Webhook 实际成功
+但本地 mark_sent 前进程崩溃
+重启后再次转发
+```
+
+这个系统优先保证不丢，允许偶发重复。接收端最好按 `dedupe_key` 幂等。
+
+## 验收标准
+
+```text
+[ ] 2xx -> sent
+[ ] 500 -> pending retry
+[ ] timeout -> pending retry
+[ ] 超过 max_retry -> failed
+[ ] kill -9 during sending -> 重启后 Reaper 恢复 pending
+[ ] payload 包含 dedupe_key
+```
+
+---
+
+# 12. 阶段 7：恢复、心跳、部署
+
+## systemd service
+
+```ini
+[Unit]
+Description=Air780E SMS Forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/air780e-smsd --config /etc/air780e-smsd/config.toml
+WorkingDirectory=/var/lib/air780e-smsd
+Restart=always
+RestartSec=3
+User=air780e
+Group=air780e
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## 配置文件
+
+```toml
+[app]
+name = "air780e-smsd"
+instance_id = "pi-air780e-01"
+
+[modem]
+port = "/dev/ttyUSB2"
+baud_rate = 115200
+storage = "SM"
+read_buffer_limit = 4096
+init_timeout_secs = 60
+sim_ready_wait_secs = 60
+
+[database]
+url = "sqlite:///var/lib/air780e-smsd/sms.db?mode=rwc"
+max_connections = 1
+
+[forwarder]
+kind = "webhook"
+url = "https://example.com/sms-webhook"
+timeout_secs = 10
+
+[retry]
+max_retry = 10
+base_delay_secs = 60
+max_delay_secs = 3600
+
+[worker]
+forward_interval_secs = 3
+reaper_interval_secs = 60
+health_interval_secs = 60
+sending_timeout_secs = 300
+```
+
+## 恢复策略
+
+| 异常           | 处理                              |
+| ------------ | ------------------------------- |
+| AT 连续超时 3 次  | 关闭串口，重新 open，重新 init            |
+| 串口 reopen 失败 | 返回 fatal，让 systemd 重启           |
+| SIM 不 READY  | 等待 60 秒，失败后重启                   |
+| PDU 解码失败     | raw_pdu 入库，status=decode_failed |
+| DB 写失败       | 不删除模块短信                         |
+| Webhook 失败   | pending retry                   |
+| sending 卡死   | Reaper 恢复 pending               |
+| buffer 超限    | 清空 buffer，记录 modem_event        |
+
+## 部署前操作
+
+```bash
+sudo systemctl disable --now ModemManager
+
+sudo useradd --system --home /var/lib/air780e-smsd --shell /usr/sbin/nologin air780e
+sudo mkdir -p /etc/air780e-smsd /var/lib/air780e-smsd
+sudo chown -R air780e:air780e /var/lib/air780e-smsd
+```
+
+---
+
+# 13. SNAFU 错误设计
+
+```rust
+#[derive(Debug, snafu::Snafu)]
+pub enum AppError {
+    #[snafu(display("config error: {message}"))]
+    Config { message: String },
+
+    #[snafu(display("serial open failed: path={path}"))]
+    SerialOpen {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("AT command failed: cmd={cmd}, response={response}"))]
+    AtCommand {
+        cmd: String,
+        response: String,
+    },
+
+    #[snafu(display("AT command timeout: cmd={cmd}"))]
+    AtTimeout {
+        cmd: String,
+    },
+
+    #[snafu(display("modem init failed: step={step}"))]
+    ModemInit {
+        step: String,
+    },
+
+    #[snafu(display("PDU decode failed: reason={reason}, raw={raw_pdu}"))]
+    PduDecode {
+        reason: String,
+        raw_pdu: String,
+    },
+
+    #[snafu(display("database operation failed: op={op}"))]
+    Database {
+        op: String,
+        source: sea_orm::DbErr,
+    },
+
+    #[snafu(display("forward failed: target={target}"))]
+    Forward {
+        target: String,
+        source: reqwest::Error,
+    },
+
+    #[snafu(display("invalid state transition: from={from}, to={to}"))]
+    InvalidState {
+        from: String,
+        to: String,
+    },
+}
+```
+
+## 错误处理规则
+
+```text
+AtActor 初始化失败：
+  允许 actor fail，交给 supervisor/systemd
+
+AT 临时超时：
+  重试，连续失败后重连串口
+
+数据库写失败：
+  不删除模块短信
+
+PDU 解码失败：
+  raw_pdu 入库，标记 decode_failed
+
+Webhook 失败：
+  不 panic，mark_failed
+
+状态转换错误：
+  记录 modem_event / app_event
+```
+
+---
+
+# 14. 完整任务清单
+
+## A. 实机验证
+
+```text
+[ ] 找到 Air780E AT 口
+[ ] 禁用 ModemManager
+[ ] AT 返回 OK
+[ ] ATE0 成功
+[ ] AT+CMEE=2 成功
+[ ] AT+CPIN? 返回 READY
+[ ] AT+CMGF=0 成功
+[ ] AT+CPMS="SM","SM","SM" 成功
+[ ] AT+CNMI=2,1,0,0,0 成功
+[ ] 收到 +CMTI
+[ ] AT+CMGR 能读 PDU
+[ ] AT+CMGD 能删除短信
+[ ] 保存英文 PDU 样本
+[ ] 保存中文 PDU 样本
+[ ] 保存中文长短信 PDU 样本
+```
+
+## B. 工程骨架
+
+```text
+[ ] Rust 项目初始化
+[ ] config.toml 加载
+[ ] tracing 日志
+[ ] SNAFU AppError
+[ ] domain model
+[ ] ModemPort trait
+[ ] SmsRepository trait
+[ ] ForwarderPort trait
+[ ] PduDecoder trait
+[ ] Arc<dyn Trait> 依赖注入
+```
+
+## C. 数据库
+
+```text
+[ ] SeaORM migration
+[ ] sms_messages
+[ ] sms_parts
+[ ] modem_events
+[ ] modem_status
+[ ] WAL PRAGMA
+[ ] repository 实现
+[ ] claim_next_pending 事务
+[ ] mark_sent
+[ ] mark_failed
+[ ] recover_stale_sending
+[ ] dedupe_key 唯一约束
+```
+
+## D. AT
+
+```text
+[ ] AtClient
+[ ] 统一 reader loop
+[ ] AT response parser
+[ ] URC parser
+[ ] +CMTI parser
+[ ] 初始化状态机
+[ ] command timeout
+[ ] buffer 上限保护
+[ ] 串口重连
+```
+
+## E. PDU
+
+```text
+[ ] PDU 基础字段解析
+[ ] sender 号码解析
+[ ] SCTS 时间解析
+[ ] DCS 识别
+[ ] UCS2 解码
+[ ] GSM 7-bit 解码
+[ ] UDH 8-bit ref
+[ ] UDH 16-bit ref
+[ ] sms_parts 入库
+[ ] 长短信合并
+[ ] decode_failed raw 入库
+```
+
+## F. Actor
+
+```text
+[ ] AtActor
+[ ] SmsIngestActor
+[ ] ForwarderActor
+[ ] ReaperActor
+[ ] HealthActor
+[ ] RawSmsPduReceived 消息
+[ ] SmsPersisted 消息
+[ ] ForwardTick
+[ ] HealthTick
+[ ] RecoverStaleSending
+```
+
+## G. 转发
+
+```text
+[ ] WebhookForwarder
+[ ] 2xx mark_sent
+[ ] 非 2xx mark_failed
+[ ] timeout mark_failed
+[ ] retry backoff
+[ ] payload 带 dedupe_key
+```
+
+## H. 部署
+
+```text
+[ ] systemd service
+[ ] 创建 air780e 用户
+[ ] /etc/air780e-smsd/config.toml
+[ ] /var/lib/air780e-smsd/sms.db
+[ ] journalctl 可看日志
+[ ] 开机自启动
+[ ] kill -9 恢复测试
+```
+
+---
+
+# 15. 最终验收场景
+
+## 场景 1：普通中文短信
+
+```text
+发送：验证码 123456
+预期：
+  +CMTI 被捕获
+  CMGR 读取 PDU
+  content = 验证码 123456
+  sms_messages.status = pending
+  CMGD 删除模块短信
+  Webhook 成功
+  status = sent
+```
+
+## 场景 2：中文长短信
+
+```text
+发送超过 70 个中文字符
+预期：
+  多个 PDU 分片进入 sms_parts
+  分片齐全后合并
+  sms_messages 生成一条完整短信
+  status = pending -> sent
+```
+
+## 场景 3：Webhook 挂掉
+
+```text
+Webhook 返回 500 / timeout
+预期：
+  status = pending
+  retry_count + 1
+  next_retry_at 延后
+  不丢短信
+```
+
+## 场景 4：进程转发中被杀
+
+```text
+status = sending 时 kill -9
+重启后：
+  ReaperActor 发现 stale sending
+  恢复 pending
+  ForwarderActor 继续转发
+```
+
+## 场景 5：PDU 解码失败
+
+```text
+CMGR 拿到 raw_pdu
+decoder 返回错误
+预期：
+  raw_pdu 入库
+  status = decode_failed
+  CMGD 删除模块短信
+  程序不崩
+```
+
+## 场景 6：数据库写失败
+
+```text
+SQLite 不可写 / 磁盘满
+预期：
+  不发送 SmsPersisted
+  不执行 CMGD
+  模块短信仍留在 SIM 存储
+  日志有 Database error
+```
+
+---
+
+# 16. 推荐开发顺序
+
+不要按“架构优先”，要按风险最高的地方优先：
+
+```text
+1. 实机 AT 验证
+2. PDU 样本收集
+3. SQLite schema + repository
+4. PDU decoder
+5. AtClient 初始化 + +CMTI 监听
+6. 单线程跑通：CMGR -> decode -> DB -> CMGD
+7. 接 Kameo Actor
+8. 接 Webhook Forwarder
+9. 加 Reaper/Health/systemd
+10. 做 kill -9 和断网测试
+```
+
+最重要的是第 1、4、5、6 步。Actor 不是难点，**PDU 中文长短信和 AT 串口状态机才是难点**。
+
+---
+
+# 17. 最容易翻车的点
+
+| 风险               | 必须怎么处理                           |
+| ---------------- | -------------------------------- |
+| AT 口被系统抢         | 禁用 ModemManager                  |
+| 多 Actor 同时写串口    | AtActor 独占串口                     |
+| 先 CMGD 后入库       | 严禁，必须 DB commit 后 CMGD           |
+| TEXT 模式中文乱码      | 强制 PDU                           |
+| 长短信漏片            | sms_parts 单独存，齐全才生成 sms_messages |
+| GSM 7-bit UDH 偏移 | 先保证 UCS2 中文；7-bit UDH 后置         |
+| claim 非原子        | `BEGIN IMMEDIATE`                |
+| Webhook 重复投递     | payload 带 dedupe_key             |
+| SQLite 忙         | WAL + busy_timeout + 单写连接        |
+| PDU 解码失败         | raw_pdu 入库，不 panic               |
+
+---
+
+# 18. MVP 完成定义
+
+做到下面这些，MVP 就算完成：
+
+```text
+[ ] 树莓派开机自动启动 air780e-smsd
+[ ] Air780E 初始化成功
+[ ] 不依赖 LuatOS main.lua
+[ ] PDU 模式监听短信
+[ ] 收到 +CMTI 后自动 CMGR
+[ ] 中文短信正常解码
+[ ] 中文长短信正常合并
+[ ] 短信先 SQLite 持久化
+[ ] 持久化成功后才 CMGD 删除模块短信
+[ ] 新短信 status=pending
+[ ] ForwarderActor 拉取 pending
+[ ] 转发成功 status=sent
+[ ] 转发失败自动重试
+[ ] sending 卡死能恢复
+[ ] 60 秒 heartbeat
+[ ] systemd 崩溃自动重启
+[ ] SNAFU 错误带上下文
+[ ] modem/repository/forwarder/decoder 全部 dyn trait 注入
+```
+
+这就是完整 MVP。第一版不要急着做发短信和 Web 管理后台，先把 **收短信可靠性、中文 PDU、SQLite 队列、转发重试** 打穿。
+
+[1]: https://raw.githubusercontent.com/dushixiang/uart_sms_forwarder/main/main.lua "raw.githubusercontent.com"
+[2]: https://docs.rs/kameo/latest/kameo/actor/trait.Actor.html?utm_source=chatgpt.com "Actor in kameo::actor - Rust"
+[3]: https://docs.rs/snafu?utm_source=chatgpt.com "snafu - Rust"
+[4]: https://www.sea-ql.org/SeaORM/docs/migration/writing-migration/?utm_source=chatgpt.com "Writing Migration | SeaORM 🐚 An async & dynamic ORM ..."
+[5]: https://docs.openluat.com/air780e/at/app/Command_List/SMS/CMGF/?utm_source=chatgpt.com "CMGF - at@air780e - 合宙文档中心"
+[6]: https://docs.openluat.com/air780e/at/app/Command_List/SMS/CNMI/?utm_source=chatgpt.com "CNMI - at@air780e - 合宙文档中心"
+[7]: https://docs.openluat.com/air780e/at/app/Command_List/SMS/CMGD/?utm_source=chatgpt.com "CMGD - at@air780e - 合宙文档中心"
+

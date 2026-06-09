@@ -1,0 +1,32 @@
+[Unit]
+Description=Air780E SMS Forwarder (gg-guard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gg-guard
+WorkingDirectory=/var/lib/gg-guard
+Restart=always
+RestartSec=3
+User=gg-guard
+Group=gg-guard
+
+# Environment from /etc/gg-guard/.env will be loaded by dotenvy.
+Environment=GG_GUARD_CONFIG=/etc/gg-guard/config.toml
+Environment=GG_GUARD_APP_NAME=gg-guard
+Environment=GG_GUARD_INSTANCE_ID=pi-air780e-01
+Environment=GG_GUARD_MODEM_PORT=/dev/ttyUSB2
+Environment=GG_GUARD_DATABASE_URL=sqlite:///var/lib/gg-guard/sms.db?mode=rwc
+Environment=GG_GUARD_WEBHOOK_URL=https://example.com/sms-webhook
+Environment=RUST_LOG=info
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gg-guard
+
+[Install]
+WantedBy=multi-user.target
