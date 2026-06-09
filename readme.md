@@ -8,15 +8,15 @@
 
 ## 工作流程
 
-```text
-短信到达 SIM
-  -> Air780E 上报 +CMTI
-  -> 程序通过 AT+CMGR 读取 PDU
-  -> 解码短信内容
-  -> 写入 SQLite
-  -> 删除 SIM 中的短信
-  -> Webhook 转发
-  -> 标记 sent / failed
+```mermaid
+stateDiagram-v2
+    [*] --> pending: 收到短信并入库
+    pending --> sending: Forwarder claim
+    sending --> sent: webhook 成功
+    sending --> pending: webhook 失败但可重试
+    sending --> failed: 超过最大重试次数
+    sending --> pending: Reaper 恢复超时任务
+    [*] --> decode_failed: PDU 解码失败但 raw 已落库
 ```
 
 ## 核心特性
