@@ -16,6 +16,7 @@ use gg_guard::domain::port::forwarder_port::ForwarderPort;
 use gg_guard::domain::port::modem_port::ModemPort;
 use gg_guard::domain::port::sms_repository::SmsRepository;
 use gg_guard::infrastructure::forwarder::webhook_forwarder::WebhookForwarder;
+use gg_guard::infrastructure::http;
 use gg_guard::infrastructure::modem::air780e_at_modem::Air780eAtModem;
 use gg_guard::infrastructure::persistence::migration;
 use gg_guard::infrastructure::persistence::seaorm_sms_repository::SeaOrmSmsRepository;
@@ -134,6 +135,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = h_ref.tell(HealthTick).await;
         }
     });
+
+    // ── HTTP / Web UI ────────────────────────────────────────────────
+    // Runs concurrently with the actor tick loops; pure read-only access to
+    // the same SQLite-backed repository. Disable by leaving [api].addr empty.
+    if !settings.api.addr.trim().is_empty() {
+        let http_opts = http::HttpOptions {
+            addr: settings.api.addr.clone(),
+            cors_origins: settings.api.cors_origins.clone(),
+            web_dir: std::path::PathBuf::from(&settings.api.web_dir),
+        };
+        let router = http::build_router(repo.clone(), &http_opts);
+        let http_addr = http_opts.addr.clone();
+        tokio::spawn(async move {
+            http::run(router, &http_addr).await;
+        });
+        info!(addr = %settings.api.addr, "HTTP server requested");
+    } else {
+        info!("HTTP server disabled (empty [api].addr)");
+    }
 
     info!("gg-guard running; press Ctrl+C to stop");
 

@@ -23,3 +23,9 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 anyhow = "1"
+# HTTP layer for the Web UI (axum 0.8 + tower-http 0.6 are already resolved
+# transitively by console-subscriber, so pinning the same versions keeps the
+# dependency graph free of duplicates).
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }

@@ -10,6 +10,8 @@ pub struct Settings {
     pub forwarder: ForwarderConfig,
     pub retry: RetryConfig,
     pub worker: WorkerConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +56,40 @@ pub struct WorkerConfig {
     pub reaper_interval_secs: u64,
     pub health_interval_secs: u64,
     pub sending_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    /// Bind address for the HTTP/Web UI server, e.g. `0.0.0.0:8080`. Set
+    /// empty to disable the server.
+    #[serde(default = "default_api_addr")]
+    pub addr: String,
+    /// Allowed CORS origins (full origin strings). Empty means allow any —
+    /// fine for development / the dev proxy, tighten for production.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Directory of the built frontend assets. Defaults to `web/dist` next to
+    /// the binary's working dir.
+    #[serde(default = "default_web_dir")]
+    pub web_dir: String,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            addr: default_api_addr(),
+            cors_origins: Vec::new(),
+            web_dir: default_web_dir(),
+        }
+    }
+}
+
+fn default_api_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+fn default_web_dir() -> String {
+    "web/dist".to_string()
 }
 
 impl Settings {
@@ -107,6 +143,16 @@ impl Settings {
         {
             s.forwarder.url = v;
         }
+        // API overrides
+        if let Ok(v) = std::env::var("GG_GUARD_API_ADDR").or_else(|_| std::env::var("API_ADDR")) {
+            s.api.addr = v;
+        }
+        if let Ok(v) = std::env::var("GG_GUARD_CORS_ORIGINS") {
+            s.api.cors_origins = v.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+        }
+        if let Ok(v) = std::env::var("GG_GUARD_WEB_DIR") {
+            s.api.web_dir = v;
+        }
     }
 
     fn from_env() -> Self {
@@ -157,6 +203,22 @@ impl Settings {
                 reaper_interval_secs: 60,
                 health_interval_secs: 60,
                 sending_timeout_secs: 300,
+            },
+            api: ApiConfig {
+                addr: std::env::var("GG_GUARD_API_ADDR")
+                    .or_else(|_| std::env::var("API_ADDR"))
+                    .unwrap_or_else(|_| "0.0.0.0:8080".into()),
+                cors_origins: std::env::var("GG_GUARD_CORS_ORIGINS")
+                    .ok()
+                    .map(|v| {
+                        v.split(',')
+                            .map(|o| o.trim().to_string())
+                            .filter(|o| !o.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                web_dir: std::env::var("GG_GUARD_WEB_DIR")
+                    .unwrap_or_else(|_| "web/dist".into()),
             },
         }
     }

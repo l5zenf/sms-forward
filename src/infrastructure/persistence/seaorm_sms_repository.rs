@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, DbBackend, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, Set, Statement, TransactionTrait,
+    DatabaseTransaction, DbBackend, EntityTrait, IntoActiveModel, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -10,8 +10,11 @@ use tracing::{info, warn};
 use crate::domain::error::AppError;
 use crate::domain::model::sms_message::{NewSmsMessage, SmsMessage};
 use crate::domain::model::sms_part::{MultipartKey, NewSmsPart};
-use crate::domain::port::sms_repository::SmsRepository;
-use crate::infrastructure::persistence::entity::{sms_message, sms_part};
+use crate::domain::port::sms_repository::{
+    MessageFilter, MessagePage, ModemEventRecord, ModemStatusRecord, StatusCounts,
+    SmsRepository,
+};
+use crate::infrastructure::persistence::entity::{modem_event, modem_status, sms_message, sms_part};
 
 pub struct SeaOrmSmsRepository {
     db: DatabaseConnection,
@@ -353,6 +356,146 @@ impl SmsRepository for SeaOrmSmsRepository {
             info!(count = count, "recovered stale sending messages");
         }
         Ok(count)
+    }
+
+    async fn list_messages(&self, filter: MessageFilter) -> Result<MessagePage, AppError> {
+        // Limit bounds to keep queries cheap even if the client sends a huge
+        // value; 0 means default.
+        let limit = match filter.limit {
+            0 => 50,
+            n if n > 200 => 200,
+            n => n,
+        };
+
+        // Each `apply_filter` clones the base builder so the page query keeps
+        // the same conditions as the count query.
+        let base = || {
+            let mut q = sms_message::Entity::find().order_by_desc(sms_message::Column::Id);
+            if let Some(status) = filter.status.as_deref() {
+                if !status.is_empty() {
+                    q = q.filter(sms_message::Column::Status.eq(status));
+                }
+            }
+            if let Some(query) = filter.query.as_deref() {
+                let trimmed = query.trim();
+                if !trimmed.is_empty() {
+                    // SQLite LIKE is case-insensitive for ASCII by default, which
+                    // is good enough for sender/content free-text search.
+                    let pat = format!("%{trimmed}%");
+                    q = q.filter(
+                        sea_orm::Condition::any()
+                            .add(sms_message::Column::Sender.like(&pat))
+                            .add(sms_message::Column::Content.like(&pat)),
+                    );
+                }
+            }
+            q
+        };
+
+        let total = base()
+            .count(&self.db)
+            .await
+            .map_err(|e| Self::db_err("list_messages count", e))?;
+
+        let rows = base()
+            .offset(filter.offset)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .map_err(|e| Self::db_err("list_messages query", e))?;
+
+        let items = rows.into_iter().map(entity_to_domain).collect();
+
+        Ok(MessagePage {
+            items,
+            total,
+            limit,
+            offset: filter.offset,
+        })
+    }
+
+    async fn get_message(&self, id: i64) -> Result<Option<SmsMessage>, AppError> {
+        let row = sms_message::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .map_err(|e| Self::db_err("get_message", e))?;
+        Ok(row.map(entity_to_domain))
+    }
+
+    async fn count_by_status(&self) -> Result<StatusCounts, AppError> {
+        // Raw SQL GROUP BY keeps this to one round-trip and sidesteps
+        // select_only()/into_tuple API churn across sea-orm patch versions.
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT status, COUNT(*) AS cnt FROM sms_messages GROUP BY status",
+                [],
+            ))
+            .await
+            .map_err(|e| Self::db_err("count_by_status", e))?;
+
+        let mut counts = StatusCounts::default();
+        for row in rows {
+            let status: String = row
+                .try_get("", "status")
+                .map_err(|e| Self::db_err("count_by_status row.status", e))?;
+            let cnt: i64 = row
+                .try_get("", "cnt")
+                .map_err(|e| Self::db_err("count_by_status row.cnt", e))?;
+            let n = cnt.max(0) as u64;
+            counts.total += n;
+            match status.as_str() {
+                "pending" => counts.pending += n,
+                "sending" => counts.sending += n,
+                "sent" => counts.sent += n,
+                "failed" => counts.failed += n,
+                "decode_failed" => counts.decode_failed += n,
+                _ => counts.other += n,
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn latest_modem_status(&self) -> Result<Option<ModemStatusRecord>, AppError> {
+        let row = modem_status::Entity::find()
+            .order_by_desc(modem_status::Column::Id)
+            .one(&self.db)
+            .await
+            .map_err(|e| Self::db_err("latest_modem_status", e))?;
+        Ok(row.map(|m| ModemStatusRecord {
+            sim_ready: m.sim_ready != 0,
+            registered: m.registered != 0,
+            roaming: m.roaming != 0,
+            csq: m.csq,
+            rssi_dbm: m.rssi_dbm,
+            operator: m.operator,
+            last_error: m.last_error,
+            updated_at: m.updated_at,
+        }))
+    }
+
+    async fn recent_modem_events(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<ModemEventRecord>, AppError> {
+        let lim = if limit == 0 { 50 } else if limit > 500 { 500 } else { limit };
+        let rows = modem_event::Entity::find()
+            .order_by_desc(modem_event::Column::Id)
+            .limit(lim)
+            .all(&self.db)
+            .await
+            .map_err(|e| Self::db_err("recent_modem_events", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|m| ModemEventRecord {
+                id: m.id,
+                event_type: m.event_type,
+                payload: m.payload,
+                created_at: m.created_at,
+            })
+            .collect())
     }
 }
 

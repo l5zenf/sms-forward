@@ -36,3 +36,12 @@ forward_interval_secs = 3
 reaper_interval_secs = 60
 health_interval_secs = 60
 sending_timeout_secs = 300
+
+# Built-in HTTP API + Web UI server. Leave `addr` empty to disable.
+# Before enabling the UI, build the frontend: `pnpm --dir web install && pnpm --dir web build`
+[api]
+addr = "0.0.0.0:8080"
+# Tighten in production, e.g. ["https://sms.example.com"]. Empty = allow any.
+cors_origins = []
+# Absolute or relative path to the built frontend dist directory.
+web_dir = "web/dist"

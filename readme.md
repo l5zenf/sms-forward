@@ -28,6 +28,7 @@ stateDiagram-v2
 - SQLite 本地持久化队列
 - Webhook 自动转发
 - 失败重试与卡死任务恢复
+- 内置 Web 控制台（React 19 + zustand，仪表盘 / 短信 / 调制解调器 / 系统事件多页签）
 - 低 CPU 占用，适合树莓派长期运行
 
 ## 运行
@@ -52,6 +53,56 @@ cargo build --release
 target/release/gg-guard
 ```
 
+## Web 控制台
+
+`gg-guard` 自带一个多页面 Web 控制台，用于实时查看短信队列、状态统计和调制解调器状态。后端用 axum 暴露只读 JSON 接口，前端用 React 19 + react-router + zustand 实现，构建产物会被内嵌服务。
+
+### 构建 Web 资源
+
+```bash
+# 在项目根目录执行（需要 Node.js / pnpm）
+pnpm --dir web install
+pnpm --dir web build          # 产物输出到 web/dist
+```
+
+仅在修改前端代码后需要重新构建；`gg-guard` 启动时会读取 `GG_GUARD_WEB_DIR`（默认 `web/dist`）下的静态资源。
+
+### 启动方式
+
+二进制启动后默认监听 `0.0.0.0:8080`，浏览器访问 `http://<设备IP>:8080/` 即可：
+
+```bash
+GG_GUARD_MODEM_PORT=/dev/ttyACM0 \
+GG_GUARD_WEBHOOK_URL=http://127.0.0.1:8082/sms \
+GG_GUARD_DATABASE_URL=sqlite:///var/lib/gg-guard/sms.db?mode=rwc \
+GG_GUARD_WEB_DIR=web/dist \
+./gg-guard
+```
+
+### HTTP 接口
+
+| 方法 | 路径                       | 说明                                          |
+| ---- | -------------------------- | --------------------------------------------- |
+| GET  | `/api/health`              | 后端存活检查                                  |
+| GET  | `/api/stats`               | 按状态分组的短信计数                          |
+| GET  | `/api/messages`            | 分页短信列表，支持 `status`、`q`、`page`、`size` |
+| GET  | `/api/messages/{id}`       | 单条短信详情                                  |
+| GET  | `/api/modem/status`        | 调制解调器当前状态（SIM / 信号 / 注册）       |
+| GET  | `/api/modem/events`        | 最近的状态变化事件                            |
+
+### 前端开发模式
+
+修改前端时建议用 Vite 的热更新（端口 5173，会代理 `/api` 到 `127.0.0.1:8080`）：
+
+```bash
+# 终端 1：跑后端
+GG_GUARD_API_ADDR=127.0.0.1:8080 ./target/debug/gg-guard
+
+# 终端 2：跑前端 dev server
+pnpm --dir web dev
+# 浏览器打开 http://127.0.0.1:5173/
+```
+
 ## 配置
 
 常用环境变量：
@@ -61,6 +112,9 @@ target/release/gg-guard
 | `GG_GUARD_MODEM_PORT`   | AT 串口路径       | `/dev/ttyACM0`                           |
 | `GG_GUARD_WEBHOOK_URL`  | 短信转发 Webhook  | `http://127.0.0.1:8082/sms`              |
 | `GG_GUARD_DATABASE_URL` | SQLite 数据库地址 | `sqlite:///tmp/gg-guard/sms.db?mode=rwc` |
+| `GG_GUARD_API_ADDR`     | HTTP/Web UI 监听地址（留空则禁用） | `0.0.0.0:8080`               |
+| `GG_GUARD_CORS_ORIGINS` | 允许的 CORS 来源，逗号分隔（留空则允许全部） | `https://sms.example.com`   |
+| `GG_GUARD_WEB_DIR`      | 前端构建产物目录  | `web/dist`                               |
 | `RUST_LOG`              | 日志级别          | `info,sqlx=warn`                         |
 
 ## 组件说明

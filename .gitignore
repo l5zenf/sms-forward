@@ -1,6 +1,9 @@
 /target
 .DS_Store
 .claude/
+web/node_modules/
+web/dist/
+web/pnpm-lock.yaml
 
 # Cargo
 **/*.rs.bk
